@@ -1,5 +1,6 @@
 import datetime
 import argparse
+import os
 
 from bambooData import *
 from utils import *
@@ -70,79 +71,63 @@ def train(args: argparse):
                use_scaler=True)
 
 
-
-def predict():
-    dataset_path = args.dataset_path
-    annotation_file_paths = find_single_json_file(dataset_path)
-    img_dict, annotation_df = get_Img_Ann(dataset_path, annotation_file_paths)
-    dataset, _ = getDatasets(img_dict, annotation_df, rate=1)
-
-    img_keys = list(img_dict.keys())
-    file_id = 'P21033110123310_jpg.rf.a35a6885d20ed2a67529b6cb816650dd'
-    test_file = img_dict[file_id]
-    test_img = Image.open(test_file).convert('RGB')
-
-    # 获取标注的mask
-    annotation = annotation_df.loc[file_id]
-    shape_points = annotation['shapes']['points']
-    xy_coords = [[tuple(p) for p in points] for points in shape_points]
-    mask_imgs = [create_polygon_mask(test_img.size, xy) for xy in xy_coords]
-    target_masks = Mask(
-        torch.concat([Mask(transforms.PILToTensor()(mask_img), dtype=torch.bool) for mask_img in mask_imgs]))
-
-    # 获取标注的labels
-    target_labels = [class_names[i] for i in annotation['shapes']['label']]
-
-    # 获取标注的bboxs
-    target_bboxes = BoundingBoxes(data=torchvision.ops.masks_to_boxes(target_masks), format='xyxy',
-                                  canvas_size=test_img.size[::-1])
-
+def predict(args):
+    # Initialize model
     model = create_mask_model(class_names)
-    model.load_state_dict(torch.load(args.model_path))
+    model.load_state_dict(torch.load(args.model_path, map_location=device, weights_only=True))
     model.eval()
     model.to(device)
-    input_tensor = transforms.Compose([transforms.ToImage(), transforms.ToDtype(torch.float32, scale=True)])(test_img)[
-        None].to(device)
-    with torch.no_grad():
-        model_output = model(input_tensor)
 
-    threshold = 0.5
-    model_output = move_data_to_device(model_output, 'cpu')
-    scores_mask = model_output[0]['scores'] > threshold
-    pred_bboxes = BoundingBoxes(model_output[0]['boxes'][scores_mask], format='xyxy',
-                                canvas_size=test_img.size[::-1])
+    # Define image transformations
+    transform = transforms.Compose([
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True)
+    ])
 
-    # Get the class names for the predicted label indices
-    pred_labels = [class_names[int(label)] for label in model_output[0]['labels'][scores_mask]]
+    # Create output directory if not exists
+    output_path = os.path.join(args.dataset_path, "predictions")
+    os.makedirs(output_path, exist_ok=True)
 
-    # Extract the confidence scores
-    pred_scores = model_output[0]['scores']
+    # Process each image in dataset_path
+    for file_name in os.listdir(args.dataset_path):
+        if file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+            # Load and preprocess image
+            img_path = os.path.join(args.dataset_path, file_name)
+            test_img = Image.open(img_path).convert('RGB')
+            input_tensor = transform(test_img)[None].to(device)
 
-    # Scale and stack the predicted segmentation masks
-    pred_masks = F.interpolate(model_output[0]['masks'][scores_mask], size=test_img.size[::-1])
-    pred_masks = torch.concat([Mask(torch.where(mask >= threshold, 1, 0), dtype=torch.bool) for mask in pred_masks])
+            # Model inference
+            with torch.no_grad():
+                model_output = model(input_tensor)
 
-    img_tensor = transforms.PILToTensor()(test_img)
+            model_output = move_data_to_device(model_output, 'cpu')
+            scores_mask = model_output[0]['scores'] > args.threshold
+            pred_bboxes = BoundingBoxes(model_output[0]['boxes'][scores_mask], format='xyxy',
+                                        canvas_size=test_img.size[::-1])
+            pred_labels = [class_names[int(label)] for label in model_output[0]['labels'][scores_mask]]
+            pred_scores = model_output[0]['scores'][scores_mask]
+            pred_masks = F.interpolate(model_output[0]['masks'][scores_mask], size=test_img.size[::-1])
+            pred_masks = torch.concat([torch.where(mask >= args.threshold, 1, 0) for mask in pred_masks]).bool()
 
-    # Annotate the test image with the target segmentation masks
-    annotated_tensor = draw_segmentation_masks(image=img_tensor, masks=target_masks, alpha=0.3)
-    # Annotate the test image with the target bounding boxes
-    annotated_tensor = draw_bboxes(image=annotated_tensor, boxes=target_bboxes, labels=target_labels)
-    # Display the annotated test image
-    annotated_test_img = tensor_to_pil(annotated_tensor)
+            # Annotate image with predictions
+            img_tensor = transforms.PILToTensor()(test_img)
 
-    # Annotate the test image with the predicted segmentation masks
-    annotated_tensor = draw_segmentation_masks(image=img_tensor, masks=pred_masks, alpha=0.3)
-    # Annotate the test image with the predicted labels and bounding boxes
-    annotated_tensor = draw_bboxes(
-        image=annotated_tensor,
-        boxes=pred_bboxes,
-        labels=[f"{label}\n{prob * 100:.2f}%" for label, prob in zip(pred_labels, pred_scores)]
-    )
+            #获取实例的个数，以便生产色彩列表
+            colors=generate_colors(pred_masks.size()[0])
+            annotated_tensor = draw_segmentation_masks(image=img_tensor, masks=pred_masks, alpha=0.5,colors=colors)
+            annotated_tensor = draw_bounding_boxes(
+                image=annotated_tensor,
+                boxes=pred_bboxes,
+                labels=[f"{label}\n{prob * 100:.2f}%" for label, prob in zip(pred_labels, pred_scores)],
+                colors=colors,
+                width=1
+            )
 
-    res = stack_imgs([annotated_test_img, tensor_to_pil(annotated_tensor)])
-    res.show()
-    res.save("res.jpg")
+            # Save annotated image
+            output_file_name = f"pred_{file_name.split('.')[0]}.png"
+            output_file_path = os.path.join(output_path, output_file_name)
+            write_png(annotated_tensor, output_file_path)
+            print(f"Saved prediction for {file_name} to {output_file_path}")
 
 
 if __name__ == '__main__':
@@ -152,7 +137,9 @@ if __name__ == '__main__':
                         help="指定是训练还是预测模式")
     parser.add_argument('--dataset_path', type=str, help="数据集的路径，里面包含图片和标注的json文件", required=True)
 
-    parser.add_argument('--model_path',type=str,help="训练好的模型的路径，如果指定mode=predict，这个参数必须要!")
+    parser.add_argument('--model_path', type=str, help="训练好的模型的路径，如果指定mode=predict，这个参数必须要!")
+
+    parser.add_argument('--threshold', type=float, default=0.7, help="预测阈值，如果指定mode=predict，这个参数必须要!")
 
     args = parser.parse_args()
 

@@ -7,18 +7,31 @@ from cjm_pytorch_utils.core import pil_to_tensor, tensor_to_pil, get_torch_devic
 from torch.amp import autocast
 import math
 from functools import partial
-
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
 # Import Mask R-CNN
 from torchvision.models.detection import maskrcnn_resnet50_fpn_v2, MaskRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
 from cjm_pil_utils.core import resize_img, get_img_files, stack_imgs
+from torchvision.io import write_png
 
+# 项目名称，可以自行修改，里面会存放一些存放了训练的一些模型信息，如果没有需要自行创建
 project_name = f"pytorch-mask-r-cnn-instance-segmentation"
 project_dir = Path(f"./{project_name}/")
-
 draw_bboxes = partial(draw_bounding_boxes, fill=False, width=2)
+
+
+def generate_colors(num_colors):
+    """生成足够多的对比色"""
+    colormap = cm.get_cmap('plasma', num_colors)  # 使用 'tab20' 颜色映射
+    colors = [
+        mcolors.to_hex(colormap(i))  # 转换为十六进制颜色字符串
+        for i in range(num_colors)
+    ]
+    return colors
+
 
 def find_single_json_file(directory: str):
     """
