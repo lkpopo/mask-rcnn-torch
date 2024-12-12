@@ -1,4 +1,5 @@
 import torch
+from datetime import datetime
 from pathlib import Path
 from tqdm.auto import tqdm
 import json
@@ -9,8 +10,9 @@ import math
 from functools import partial
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
 # Import Mask R-CNN
-from torchvision.models.detection import maskrcnn_resnet50_fpn_v2, MaskRCNN
+from torchvision.models.detection import maskrcnn_resnet50_fpn_v2, maskrcnn_resnet50_fpn, MaskRCNN
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
@@ -173,7 +175,7 @@ def train_loop(model,
         None
     """
     # Initialize a gradient scaler for mixed-precision training if the device is a CUDA GPU
-    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' and use_scaler else None
+    scaler = torch.amp.GradScaler(device='cuda') if device.type == 'cuda' and use_scaler else None
     best_loss = float('inf')  # Initialize the best validation loss
 
     # Loop over the epochs
@@ -190,17 +192,64 @@ def train_loop(model,
             best_loss = valid_loss
             torch.save(model.state_dict(), checkpoint_path)
 
-            # Save metadata about the training process
-            training_metadata = {
-                'epoch': epoch,
-                'train_loss': train_loss,
-                'valid_loss': valid_loss,
-                'learning_rate': lr_scheduler.get_last_lr()[0],
-                'model_architecture': model.name
-            }
-            with open(Path(checkpoint_path.parent / 'training_metadata.json'), 'w') as f:
-                json.dump(training_metadata, f)
-
+        # Save metadata about the training process
+        training_metadata = {
+            'epoch': epoch,
+            'train_loss': train_loss,
+            'valid_loss': valid_loss,
+            'learning_rate': lr_scheduler.get_last_lr()[0],
+            'model_architecture': model.name
+        }
+        with open(Path(checkpoint_path.parent / 'training_metadata.json'), 'a') as f:
+            json.dump(training_metadata, f)
+            f.write('\n')
     # If the device is a GPU, empty the cache
     if device.type != 'cpu':
         getattr(torch, device.type).empty_cache()
+
+
+def parse_timestamp(file_name):
+    """
+    从文件名解析时间戳
+    :param file_name: 图片文件名，如 P22033011333910.jpg
+    :return: 解析后的时间字符串，如 '2022-03-30 11:33'
+    """
+    # 检查文件名格式是否正确
+    if len(file_name) >= 15 and file_name.startswith("P"):
+        year = "20" + file_name[1:3]  # 解析年份
+        month = file_name[3:5]  # 解析月份
+        day = file_name[5:7]  # 解析日期
+        hour = file_name[7:9]  # 解析小时
+        minute = file_name[9:11]  # 解析分钟
+        return f"{year}-{month}-{day} {hour}:{minute}"
+    else:
+        raise ValueError(f"Invalid file name format: {file_name}")
+
+
+def update_tracking_data(tracking_data, track_results, timestamp):
+    # 为每个时间戳创建一个新的字典，存储实例的宽度和高度
+    if timestamp not in tracking_data:
+        tracking_data[timestamp] = {}
+
+    for track in track_results:
+        x1, y1, x2, y2, track_id = track
+        width = x2 - x1
+        height = y2 - y1
+        # 将实例的宽度和高度存储到时间戳下
+        tracking_data[timestamp][f'track_id_{track_id}'] = {
+            'width': width,
+            'height': height
+        }
+
+    return tracking_data
+
+
+def parse_timestamp_to_date(timestamp):
+    # 假设时间戳格式为 "22022-3.30-11:33" 或类似格式
+    date_str = timestamp[:10]  # 提取年份和日期部分
+    time_str = timestamp[11:]  # 提取时间部分
+    # 转换为标准时间格式
+    date_obj = datetime.strptime(f"{date_str}", "%Y-%m-%d")
+    time_obj = datetime.strptime(time_str, "%H:%M")
+    full_datetime = datetime.combine(date_obj, time_obj.time())
+    return full_datetime

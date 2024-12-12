@@ -1,18 +1,157 @@
-import datetime
 import argparse
 import os
-
+import numpy as np
 from bambooData import *
 from utils import *
 from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.nn.functional as F
+from sort import Sort
+import json
 
 torchvision.disable_beta_transforms_warning()
 
+tracker = Sort()
 device = get_torch_device()
 dtype = torch.float32
 class_names = ['background', 'bamboo']
+FONT_PATH = r"C:\Windows\Fonts\simhei.ttf"  # 替换为你的字体文件路径
+
+
+def load_model(args):
+    """加载模型"""
+    model = create_mask_model(class_names)
+    model.load_state_dict(torch.load(args.model_path, map_location=device, weights_only=True))
+    model.eval()
+    model.to(device)
+    return model
+
+
+def preprocess_image(img_path, transform):
+    """加载并预处理图像"""
+    test_img = Image.open(img_path).convert('RGB')
+    input_tensor = transform(test_img)[None].to(device)
+    return test_img, input_tensor
+
+
+def get_detections(model, input_tensor, threshold):
+    """从模型输出中获取检测结果"""
+    with torch.no_grad():
+        model_output = model(input_tensor)
+    model_output = move_data_to_device(model_output, 'cpu')
+
+    height, width = input_tensor.shape[2], input_tensor.shape[3]
+    # 根据分数阈值筛选目标
+    scores_mask = model_output[0]['scores'] > threshold
+    pred_bboxes = model_output[0]['boxes'][scores_mask]  # 边界框
+    pred_labels = [class_names[int(label)] for label in model_output[0]['labels'][scores_mask]]
+    pred_scores = model_output[0]['scores'][scores_mask]  # 分数
+    pred_masks = torch.concat(
+        [torch.where(mask >= threshold, 1, 0) for mask in
+         F.interpolate(model_output[0]['masks'][scores_mask], size=(height, width))]).bool()
+    return pred_bboxes, pred_labels, pred_scores, pred_masks
+
+
+def update_tracker(pred_bboxes, pred_scores):
+    """更新 SORT 追踪器并返回追踪结果"""
+    # 转换为 SORT 需要的格式：[x1, y1, x2, y2, score]
+    sort_detections = np.array([
+        [box[0].item(), box[1].item(), box[2].item(), box[3].item(), score.item()]
+        for box, score in zip(pred_bboxes, pred_scores)
+    ])
+    return tracker.update(sort_detections)
+
+
+def annotate_image(test_img, track_results, pred_bboxes, pred_masks, font_path):
+    """标注图像"""
+    img_tensor = transforms.PILToTensor()(test_img)
+
+    # 获取追踪实例的颜色列表
+    colors = generate_colors(len(track_results))
+
+    # 遍历每个追踪目标，绘制分割掩码和边界框
+    for i, track in enumerate(track_results):
+        x1, y1, x2, y2, track_id = track
+
+        # 找到当前跟踪框对应的掩码
+        mask_idx = np.argmin(np.linalg.norm(pred_bboxes.numpy()[:, :4] - np.array([x1, y1, x2, y2]), axis=1))
+        current_mask = pred_masks[mask_idx]
+
+        # 在图像上绘制分割掩码
+        img_tensor = draw_segmentation_masks(
+            image=img_tensor,
+            masks=current_mask[None],  # 当前掩码
+            alpha=0.5,
+            colors=[colors[i % len(colors)]]
+        )
+
+        # 在图像上绘制边界框和 ID
+        img_tensor = draw_bounding_boxes(
+            image=img_tensor,
+            boxes=torch.tensor([[x1, y1, x2, y2]]),
+            labels=[f"  {int(track_id)}"],
+            colors=[colors[i % len(colors)]],
+            width=2,
+            font=font_path,
+            font_size=24
+        )
+    return img_tensor
+
+
+def save_image(img_tensor, output_path, file_name):
+    """保存标注后的图像"""
+    output_file_path = os.path.join(output_path, f"tracked_{file_name.split('.')[0]}.png")
+    write_png(img_tensor, output_file_path)
+    print(f"Saved tracked prediction for {file_name} to {output_file_path}")
+
+
+def plot_tracking_data(json_dir):
+    json_path = find_single_json_file(json_dir)
+    with open(json_path, 'r') as f:
+        tracking_data = json.load(f)
+    rows = []
+    for timestamp, timestamp_data in tracking_data.items():
+        for track_id, dimensions in timestamp_data.items():
+            row = {'timestamp': timestamp, 'track_id': track_id,
+                   'width': dimensions['width'], 'height': dimensions['height']}
+            rows.append(row)
+    df = pd.DataFrame(rows)
+    df['timestamp'] = pd.to_datetime(df['timestamp'].apply(parse_timestamp_to_date))
+
+    # 异常数据处理
+    track_counts = df.groupby('track_id')['timestamp'].nunique()
+    # 如果某个竹笋在2/3的图片都没检测到，那就别追踪了
+    valid_ids = track_counts[track_counts >= len(tracking_data) / 3].index
+    df = df[df['track_id'].isin(valid_ids)]
+
+    # 绘制图片
+    plt.figure(figsize=(12, 6))
+    for track_id in df['track_id'].unique():
+        track_data = df[df['track_id'] == track_id]
+        plt.plot(track_data['timestamp'], track_data['width'], label=f'Track ID {track_id}')
+    plt.xlabel('Time')
+    plt.ylabel('Width (px)')
+    plt.title('Width Changes Over Time for All Track IDs')
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    plt.grid(True)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(json_dir, 'width_changes.png'))  # 保存宽度变化图
+    plt.close()
+
+    plt.figure(figsize=(12, 6))
+    for track_id in df['track_id'].unique():
+        track_data = df[df['track_id'] == track_id]
+        plt.plot(track_data['timestamp'], track_data['height'], label=f'Track ID {track_id}')
+    plt.xlabel('Time')
+    plt.ylabel('Height (px)')
+    plt.title('Height Changes Over Time for All Track IDs')
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    plt.grid(True)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(json_dir, 'height_changes.png'))  # 保存高度变化图
+    plt.close()
 
 
 def train(args: argparse):
@@ -37,13 +176,8 @@ def train(args: argparse):
     valid_dataloader = DataLoader(valid_dataset, **data_loader_params)
 
     # 初始化模型，准备训练
-    model = create_mask_model()
-
-    if torch.cuda.device_count() > 1:
-        print(f"使用 {torch.cuda.device_count()} 个 GPU!")
-        model = nn.DataParallel(model, dtype=dtype)  # 自动使用所有可用的 GPU
-    else:
-        model = model.to(device, dtype=dtype)
+    model = create_mask_model(class_names)
+    model = model.to(device, dtype=dtype)
     model.device = device
     model.name = 'maskrcnn_resnet50_fpn_v2'
 
@@ -55,7 +189,7 @@ def train(args: argparse):
 
     # 设置学习率和训练轮数
     lr = 5e-4
-    epochs = 100
+    epochs = 300
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer,
                                                        max_lr=lr,
@@ -71,63 +205,41 @@ def train(args: argparse):
                use_scaler=True)
 
 
-def predict(args):
-    # Initialize model
-    model = create_mask_model(class_names)
-    model.load_state_dict(torch.load(args.model_path, map_location=device, weights_only=True))
-    model.eval()
-    model.to(device)
-
-    # Define image transformations
+def predict(args: argparse):
+    """主预测逻辑"""
+    model = load_model(args)
     transform = transforms.Compose([
         transforms.ToImage(),
         transforms.ToDtype(torch.float32, scale=True)
     ])
-
-    # Create output directory if not exists
     output_path = os.path.join(args.dataset_path, "predictions")
     os.makedirs(output_path, exist_ok=True)
 
-    # Process each image in dataset_path
-    for file_name in os.listdir(args.dataset_path):
+    tracking_data = {}
+
+    for file_name in sorted(os.listdir(args.dataset_path)):  # 按顺序处理帧
         if file_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-            # Load and preprocess image
+            try:
+                # 从文件名解析时间戳
+                timestamp = parse_timestamp(file_name)
+            except ValueError as e:
+                print(e)
+                continue
             img_path = os.path.join(args.dataset_path, file_name)
-            test_img = Image.open(img_path).convert('RGB')
-            input_tensor = transform(test_img)[None].to(device)
+            test_img, input_tensor = preprocess_image(img_path, transform)
+            pred_bboxes, pred_labels, pred_scores, pred_masks = get_detections(model, input_tensor, args.threshold)
+            track_results = update_tracker(pred_bboxes, pred_scores)
 
-            # Model inference
-            with torch.no_grad():
-                model_output = model(input_tensor)
+            # 更新追踪表
+            tracking_table = update_tracking_data(tracking_data, track_results, timestamp)
 
-            model_output = move_data_to_device(model_output, 'cpu')
-            scores_mask = model_output[0]['scores'] > args.threshold
-            pred_bboxes = BoundingBoxes(model_output[0]['boxes'][scores_mask], format='xyxy',
-                                        canvas_size=test_img.size[::-1])
-            pred_labels = [class_names[int(label)] for label in model_output[0]['labels'][scores_mask]]
-            pred_scores = model_output[0]['scores'][scores_mask]
-            pred_masks = F.interpolate(model_output[0]['masks'][scores_mask], size=test_img.size[::-1])
-            pred_masks = torch.concat([torch.where(mask >= args.threshold, 1, 0) for mask in pred_masks]).bool()
+            # 标注图像
+            annotated_img = annotate_image(test_img, track_results, pred_bboxes, pred_masks, FONT_PATH)
+            save_image(annotated_img, output_path, file_name)
 
-            # Annotate image with predictions
-            img_tensor = transforms.PILToTensor()(test_img)
-
-            #获取实例的个数，以便生产色彩列表
-            colors=generate_colors(pred_masks.size()[0])
-            annotated_tensor = draw_segmentation_masks(image=img_tensor, masks=pred_masks, alpha=0.5,colors=colors)
-            annotated_tensor = draw_bounding_boxes(
-                image=annotated_tensor,
-                boxes=pred_bboxes,
-                labels=[f"{label}\n{prob * 100:.2f}%" for label, prob in zip(pred_labels, pred_scores)],
-                colors=colors,
-                width=1
-            )
-
-            # Save annotated image
-            output_file_name = f"pred_{file_name.split('.')[0]}.png"
-            output_file_path = os.path.join(output_path, output_file_name)
-            write_png(annotated_tensor, output_file_path)
-            print(f"Saved prediction for {file_name} to {output_file_path}")
+    with open(os.path.join(output_path, "tracking_table.json"), 'w') as f:
+        json.dump(tracking_data, f, indent=4)
+    print(f"Tracking table saved to tracking_table.json")
 
 
 if __name__ == '__main__':
@@ -141,13 +253,20 @@ if __name__ == '__main__':
 
     parser.add_argument('--threshold', type=float, default=0.7, help="预测阈值，如果指定mode=predict，这个参数必须要!")
 
+    parser.add_argument('--plot', type=bool, default=False, help="绘制json数据,此时dataset_path就是包含json文件的路径")
+
     args = parser.parse_args()
 
     # 检查依赖关系
     if args.mode == "predict" and not args.model_path:
         parser.error("--model_path is required when --mode is 'predict'.")
 
+    if args.plot == True and not args.dataset_path:
+        parser.error("--dataset_path is required when --plot is 'True'.")
+
     if args.mode == 'predict':
         predict(args)
+    elif args.plot == True:
+        plot_tracking_data(args.dataset_path)
     else:
         train(args)
