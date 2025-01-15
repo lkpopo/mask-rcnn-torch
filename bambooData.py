@@ -54,11 +54,13 @@ def get_Img_Ann(dataset_path: str, annotation_file_paths: str):
         image_id = image_info['id']
         shapes = []
         labels = []
+        bbox = []
         while (count < len(annotation) and annotation[count]['image_id'] == image_id):
             coords = annotation[count]['segmentation'][0]
             # 两两一个组成一个xy坐标
             xy = [[coords[i], coords[i + 1]] for i in range(0, len(coords), 2)]
             shapes.append(xy)
+            bbox.append(annotation[count]['bbox'])
             labels.append(annotation[count]["category_id"])
             count += 1
 
@@ -66,7 +68,8 @@ def get_Img_Ann(dataset_path: str, annotation_file_paths: str):
             "image_name": image_info["file_name"][:-4],
             "shapes": {
                 "points": shapes,
-                "label": labels
+                "label": labels,
+                "bbox":bbox
             }
         }
         records.append(record)

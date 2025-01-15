@@ -18,6 +18,7 @@ from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 from torchvision.utils import draw_bounding_boxes, draw_segmentation_masks
 from cjm_pil_utils.core import resize_img, get_img_files, stack_imgs
 from torchvision.io import write_png
+import numpy as np
 
 # 项目名称，可以自行修改，里面会存放一些存放了训练的一些模型信息，如果没有需要自行创建
 project_name = f"pytorch-mask-r-cnn-instance-segmentation"
@@ -43,7 +44,7 @@ def find_single_json_file(directory: str):
     :return: 如果存在唯一的 JSON 文件，返回其路径；否则返回 None
     """
     dir_path = Path(directory)
-    json_files = list(dir_path.rglob("*.json"))  # 搜索所有 .json 文件
+    json_files = list(dir_path.glob("*.json"))  # 搜索所有 .json 文件
 
     if len(json_files) == 1:
         return str(json_files[0])  # 返回唯一 JSON 文件路径
@@ -226,19 +227,21 @@ def parse_timestamp(file_name):
         raise ValueError(f"Invalid file name format: {file_name}")
 
 
-def update_tracking_data(tracking_data, track_results, timestamp):
+def update_tracking_data(tracking_data, track_results, timestamp,bboxes):
     # 为每个时间戳创建一个新的字典，存储实例的宽度和高度
     if timestamp not in tracking_data:
         tracking_data[timestamp] = {}
 
     for track in track_results:
         x1, y1, x2, y2, track_id = track
+        idx = np.argmin(np.linalg.norm(np.array(bboxes)[:, :4] - np.array([x1, y1, x2, y2]), axis=1))
+        x1, y1, x2, y2 = bboxes[idx]
         width = x2 - x1
         height = y2 - y1
         # 将实例的宽度和高度存储到时间戳下
         tracking_data[timestamp][f'track_id_{track_id}'] = {
-            'width': width,
-            'height': height
+            'width': width.item(),
+            'height': height.item()
         }
 
     return tracking_data

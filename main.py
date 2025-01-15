@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sort import Sort
 import json
-
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 torchvision.disable_beta_transforms_warning()
 
 tracker = Sort()
@@ -231,7 +231,7 @@ def predict(args: argparse):
             track_results = update_tracker(pred_bboxes, pred_scores)
 
             # 更新追踪表
-            tracking_table = update_tracking_data(tracking_data, track_results, timestamp)
+            tracking_table = update_tracking_data(tracking_data, track_results, timestamp,pred_bboxes)
 
             # 标注图像
             annotated_img = annotate_image(test_img, track_results, pred_bboxes, pred_masks, FONT_PATH)
@@ -240,6 +240,7 @@ def predict(args: argparse):
     with open(os.path.join(output_path, "tracking_table.json"), 'w') as f:
         json.dump(tracking_data, f, indent=4)
     print(f"Tracking table saved to tracking_table.json")
+
 
 
 if __name__ == '__main__':
